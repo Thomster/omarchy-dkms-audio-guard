@@ -1,0 +1,251 @@
+#!/bin/bash
+# omarchy-dkms-audio-guard
+#
+# Watches an out-of-tree audio codec driver that is built with dkms --
+# by default snd_hda_macbookpro, which replaces the stock
+# snd_hda_codec_cs8409 so the speakers of Intel Macs with a Cirrus Logic
+# CS8409 codec (e.g. iMac19,1) work at all. With the stock module the
+# speakers are silent (speaker_outs=0).
+#
+# The driver has to be rebuilt for every kernel update, and that rebuild
+# can fail quietly: missing/mismatched headers, the PRE_BUILD step failing
+# to download the kernel sources from cdn.kernel.org (offline during the
+# update), or the patches no longer applying to a new kernel. The update
+# itself still "succeeds", and you only find out after the reboot when
+# the speakers are silent again.
+#
+# Three failure modes are checked:
+#
+#   1. An installed kernel has no dkms build of the driver. This includes
+#      a freshly installed kernel you haven't booted yet, which is the
+#      most useful case to catch: you get the warning *before* the reboot.
+#   2. The build is installed for the running kernel, but the module
+#      loaded right now is a different one (the stock codec driver, or
+#      nothing at all), even though the build predates this boot.
+#   3. The build was (re)installed during this boot, so the old module is
+#      still loaded. That one just needs a reboot.
+#
+# This script only detects and reports. With root it runs `dkms install`
+# for the kernels that are missing the build -- nothing else, and never
+# rmmod/modprobe on a live audio stack.
+#
+# Usage:
+#   omarchy-dkms-audio-guard --check [--quiet]   # read-only; exit 0 = fine, 1 = needs fix, 2 = reboot to finish
+#   sudo omarchy-dkms-audio-guard [--force]      # dkms install for every kernel missing the build
+#
+# Override the watched driver with environment variables if you reuse this
+# for a different dkms codec driver:
+#   DKMS_AUDIO_NAME   dkms package name       (default: snd_hda_macbookpro)
+#   DKMS_AUDIO_KMOD   module name, as in /sys/module (default: snd_hda_codec_cs8409)
+
+set -uo pipefail
+
+DKMS_NAME="${DKMS_AUDIO_NAME:-snd_hda_macbookpro}"
+KMOD="${DKMS_AUDIO_KMOD:-snd_hda_codec_cs8409}"
+
+MODE="fix"
+QUIET=0
+FORCE=0
+
+usage() {
+  cat <<USAGE
+Usage:
+  omarchy-dkms-audio-guard --check [--quiet]
+      Read-only. Exit 0 = nothing to do (driver not installed via dkms at
+      all, or built for every installed kernel and loaded). Exit 1 = a fix
+      is needed. Exit 2 = the build is in place but only takes effect
+      after a reboot.
+
+  sudo omarchy-dkms-audio-guard [--force]
+      Runs 'dkms install $DKMS_NAME/<version> -k <kernel>' for every
+      installed kernel that lacks the build. Refuses to do anything unless
+      the check finds a missing build, unless --force is given (then it
+      reinstalls for every installed kernel). The PRE_BUILD step of
+      snd_hda_macbookpro downloads the matching kernel sources (~150 MB)
+      from cdn.kernel.org. Reboot afterward if the running kernel was
+      rebuilt.
+USAGE
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --check) MODE="check" ;;
+    --fix) MODE="fix" ;;
+    --force) FORCE=1 ;;
+    --quiet) QUIET=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $arg" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+log() { (( QUIET )) || echo "$@"; }
+
+running_kernel() { uname -r; }
+
+# The dkms version registered for the driver, e.g. "0.1". Empty if the
+# driver isn't registered with dkms at all.
+dkms_version() {
+  command -v dkms >/dev/null 2>&1 || return 0
+  dkms status -m "$DKMS_NAME" 2>/dev/null | sed -n "s|^$DKMS_NAME/\([^,:]*\).*|\1|p" | head -1
+}
+
+# Every kernel installed by a package (Arch puts a pkgbase file into each
+# kernel package's module dir). After a kernel update and before the
+# reboot, the running kernel's dir is already gone and only the new one
+# is listed -- which is exactly the kernel that needs the build next.
+installed_kernels() {
+  local dir
+  for dir in /lib/modules/*/; do
+    [[ -f "$dir/pkgbase" ]] && basename "$dir"
+  done
+}
+
+kernel_pkgbase() { cat "/lib/modules/$1/pkgbase" 2>/dev/null; }
+
+dkms_installed_for() {
+  dkms status -m "$DKMS_NAME" -k "$1" 2>/dev/null | grep -q ": installed"
+}
+
+kernels_missing_build() {
+  local k
+  for k in $(installed_kernels); do
+    dkms_installed_for "$k" || echo "$k"
+  done
+}
+
+# Why the build is missing for kernel $1, as a hint for the user.
+missing_reason() {
+  local k="$1" version="$2"
+  if [[ ! -d "/usr/src/$DKMS_NAME-$version" ]]; then
+    echo "the dkms source /usr/src/$DKMS_NAME-$version is gone (broken symlink?) -- restore it before rebuilding"
+  elif [[ ! -e "/lib/modules/$k/build" ]]; then
+    echo "headers for $k are missing -- install $(kernel_pkgbase "$k")-headers"
+  elif [[ -f "/var/lib/dkms/$DKMS_NAME/$version/build/make.log" ]]; then
+    echo "not built or build failed -- see /var/lib/dkms/$DKMS_NAME/$version/build/make.log"
+  else
+    echo "not built (dkms autoinstall didn't run or failed before the build started)"
+  fi
+}
+
+dkms_module_file() {
+  local k="$1"
+  find "/lib/modules/$k/updates" "/lib/modules/$k/extra" "/lib/modules/$k/kernel/extra" \
+    -name "${KMOD//_/-}.ko*" 2>/dev/null | head -1
+}
+
+loaded_srcversion() { cat "/sys/module/$KMOD/srcversion" 2>/dev/null; }
+
+boot_time() { awk '/^btime/ {print $2}' /proc/stat; }
+
+run_check() {
+  local version k missing
+  version=$(dkms_version)
+  if [[ -z "$version" ]]; then
+    log "$DKMS_NAME isn't registered with dkms. Nothing to check."
+    return 0
+  fi
+
+  missing=$(kernels_missing_build)
+  if [[ -n "$missing" ]]; then
+    for k in $missing; do
+      if [[ "$k" == "$(running_kernel)" ]]; then
+        log "Running kernel $k has no $DKMS_NAME/$version build: $(missing_reason "$k" "$version")."
+      else
+        log "Installed kernel $k (not booted yet) has no $DKMS_NAME/$version build: $(missing_reason "$k" "$version")."
+        log "  Rebooting into it now would leave the speakers silent."
+      fi
+    done
+    log "Run: sudo $0"
+    return 1
+  fi
+
+  # Everything below compares against the running kernel. If its module
+  # dir is gone, a kernel update is waiting for a reboot and the new
+  # kernel's build was already confirmed above.
+  k=$(running_kernel)
+  if [[ ! -d "/lib/modules/$k" ]]; then
+    log "Kernel update pending a reboot; the $DKMS_NAME build for the new kernel is in place. Nothing to do."
+    return 0
+  fi
+
+  local file built_src loaded_src
+  file=$(dkms_module_file "$k")
+  built_src=$(modinfo -F srcversion "$file" 2>/dev/null)
+  loaded_src=$(loaded_srcversion)
+
+  if [[ -n "$built_src" && "$built_src" == "$loaded_src" ]]; then
+    log "$DKMS_NAME/$version is built for every installed kernel and loaded in the running kernel ($k). Nothing to do."
+    return 0
+  fi
+
+  if [[ -n "$file" ]] && (( $(stat -c %Y "$file") > $(boot_time) )); then
+    log "$DKMS_NAME/$version was installed for $k during this boot, but the previously loaded module is still active."
+    log "Reboot to activate it: systemctl reboot"
+    return 2
+  fi
+
+  if [[ -z "$loaded_src" ]]; then
+    log "$KMOD isn't loaded at all, although $DKMS_NAME/$version is installed for $k. Check: journalctl -k -b | grep -iE 'cs8409|snd_hda'"
+  else
+    log "The loaded $KMOD isn't the $DKMS_NAME build (srcversion $loaded_src, expected ${built_src:-unknown}) -- the stock module won over the dkms one."
+    log "Check: modinfo -n $KMOD   (should point into /lib/modules/$k/updates/dkms)"
+  fi
+  log "If the build itself looks broken, reinstall it: sudo $0 --force"
+  return 1
+}
+
+run_fix() {
+  if (( EUID != 0 )); then
+    echo "This needs root. Re-run as: sudo $0 $*" >&2
+    exit 1
+  fi
+
+  local version kernels k failed=0 did_running=0
+  version=$(dkms_version)
+  if [[ -z "$version" ]]; then
+    log "$DKMS_NAME isn't registered with dkms. Nothing to fix."
+    exit 0
+  fi
+
+  if (( FORCE )); then
+    kernels=$(installed_kernels)
+  else
+    kernels=$(kernels_missing_build)
+  fi
+  if [[ -z "$kernels" ]]; then
+    log "$DKMS_NAME/$version is installed for every installed kernel and --force wasn't given. Nothing to do."
+    log "(If a reboot is pending, check with: $0 --check)"
+    exit 0
+  fi
+
+  log "Note: building $DKMS_NAME downloads the matching kernel sources (~150 MB) from cdn.kernel.org."
+  for k in $kernels; do
+    if [[ ! -e "/lib/modules/$k/build" ]]; then
+      log "Skipping $k: headers missing. Install them first: sudo pacman -S $(kernel_pkgbase "$k")-headers"
+      failed=1
+      continue
+    fi
+    log "Installing $DKMS_NAME/$version for $k..."
+    (( FORCE )) && dkms uninstall "$DKMS_NAME/$version" -k "$k" >/dev/null 2>&1
+    if dkms install "$DKMS_NAME/$version" -k "$k"; then
+      [[ "$k" == "$(running_kernel)" ]] && did_running=1
+    else
+      log "dkms install failed for $k -- see /var/lib/dkms/$DKMS_NAME/$version/build/make.log"
+      failed=1
+    fi
+  done
+
+  log
+  if (( did_running )); then
+    log "Done. Reboot to load the rebuilt module: systemctl reboot"
+  else
+    log "Done."
+  fi
+  log "Verify with: dkms status -m $DKMS_NAME && $0 --check"
+  exit $failed
+}
+
+case "$MODE" in
+  check) run_check; exit $? ;;
+  fix) run_fix "$@" ;;
+esac
