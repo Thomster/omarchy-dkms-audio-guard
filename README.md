@@ -68,7 +68,11 @@ script.
 ## Related
 
 Modeled on [omarchy-nvidia-dkms-guard](https://github.com/Thomster/omarchy-nvidia-dkms-guard),
-which does the same for the NVIDIA dkms driver.
+which does the same for the NVIDIA DKMS driver.
+
+## Changelog
+
+Current version: **1.0.1**. See [CHANGELOG.md](CHANGELOG.md).
 
 ## How this came to be
 

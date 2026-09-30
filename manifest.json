@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
   "id": "dkms-audio-guard",
-  "name": "dkms Audio Guard",
-  "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "Detects an installed kernel without a dkms build of the snd_hda_macbookpro speaker driver (before or after the reboot), or the stock codec driver loaded instead, and notifies you to run the bundled fix. No bar icon.",
+  "name": "DKMS Audio Guard",
+  "version": "1.0.1",
+  "author": "Claude Code / Thomas Alt",
+  "description": "Detects an installed kernel without a DKMS build of the snd_hda_macbookpro speaker driver (before or after the reboot), or the stock codec driver loaded instead, and notifies you to run the bundled fix. No bar icon.",
   "kinds": [
     "service"
   ],
